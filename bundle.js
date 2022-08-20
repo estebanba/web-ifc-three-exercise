@@ -40597,6 +40597,112 @@ class InstancedInterleavedBuffer extends InterleavedBuffer {
 
 InstancedInterleavedBuffer.prototype.isInstancedInterleavedBuffer = true;
 
+class Raycaster {
+
+	constructor( origin, direction, near = 0, far = Infinity ) {
+
+		this.ray = new Ray( origin, direction );
+		// direction is assumed to be normalized (for accurate distance calculations)
+
+		this.near = near;
+		this.far = far;
+		this.camera = null;
+		this.layers = new Layers();
+
+		this.params = {
+			Mesh: {},
+			Line: { threshold: 1 },
+			LOD: {},
+			Points: { threshold: 1 },
+			Sprite: {}
+		};
+
+	}
+
+	set( origin, direction ) {
+
+		// direction is assumed to be normalized (for accurate distance calculations)
+
+		this.ray.set( origin, direction );
+
+	}
+
+	setFromCamera( coords, camera ) {
+
+		if ( camera && camera.isPerspectiveCamera ) {
+
+			this.ray.origin.setFromMatrixPosition( camera.matrixWorld );
+			this.ray.direction.set( coords.x, coords.y, 0.5 ).unproject( camera ).sub( this.ray.origin ).normalize();
+			this.camera = camera;
+
+		} else if ( camera && camera.isOrthographicCamera ) {
+
+			this.ray.origin.set( coords.x, coords.y, ( camera.near + camera.far ) / ( camera.near - camera.far ) ).unproject( camera ); // set origin in plane of camera
+			this.ray.direction.set( 0, 0, - 1 ).transformDirection( camera.matrixWorld );
+			this.camera = camera;
+
+		} else {
+
+			console.error( 'THREE.Raycaster: Unsupported camera type: ' + camera.type );
+
+		}
+
+	}
+
+	intersectObject( object, recursive = true, intersects = [] ) {
+
+		intersectObject( object, this, intersects, recursive );
+
+		intersects.sort( ascSort );
+
+		return intersects;
+
+	}
+
+	intersectObjects( objects, recursive = true, intersects = [] ) {
+
+		for ( let i = 0, l = objects.length; i < l; i ++ ) {
+
+			intersectObject( objects[ i ], this, intersects, recursive );
+
+		}
+
+		intersects.sort( ascSort );
+
+		return intersects;
+
+	}
+
+}
+
+function ascSort( a, b ) {
+
+	return a.distance - b.distance;
+
+}
+
+function intersectObject( object, raycaster, intersects, recursive ) {
+
+	if ( object.layers.test( raycaster.layers ) ) {
+
+		object.raycast( raycaster, intersects );
+
+	}
+
+	if ( recursive === true ) {
+
+		const children = object.children;
+
+		for ( let i = 0, l = children.length; i < l; i ++ ) {
+
+			intersectObject( children[ i ], raycaster, intersects, true );
+
+		}
+
+	}
+
+}
+
 /**
  * Ref: https://en.wikipedia.org/wiki/Spherical_coordinate_system
  *
@@ -103203,9 +103309,19 @@ const size = {
 
 //Creates the camera (point of view of the user)
 const camera = new PerspectiveCamera(75, size.width / size.height);
-camera.position.z = 15;
-camera.position.y = 13;
-camera.position.x = 8;
+// const camera = new OrthographicCamera(
+//   size.width / -2,
+//   size.width / 2,
+//   size.height / 2,
+//   size.height / -2,
+//   1,
+//   1000
+// );
+// camera.position.z = 20;
+// camera.position.y = 20;
+// camera.position.x = 20;
+
+camera.lookAt(scene.position);
 
 //Creates the lights of the scene
 const lightColor = 0xffffff;
@@ -103255,15 +103371,97 @@ window.addEventListener("resize", () => {
 });
 
 // ICF Loading
-const loader = new IFCLoader();
+const ifcLoader = new IFCLoader();
+
+ifcLoader.ifcManager.setupThreeMeshBVH(
+  computeBoundsTree,
+  disposeBoundsTree,
+  acceleratedRaycast
+);
+
+const ifcModels = [];
+
 const input = document.getElementById("file-input");
 input.addEventListener(
   "change",
   async () => {
     const file = input.files[0];
     const url = URL.createObjectURL(file);
-    const model = await loader.loadAsync(url);
+    const model = await ifcLoader.loadAsync(url);
     scene.add(model);
+    ifcModels.push(model);
   },
   false
 );
+
+const raycaster = new Raycaster();
+raycaster.firstHitOnly = true;
+const mouse = new Vector2$1();
+
+function cast(event) {
+  const bounds = threeCanvas.getBoundingClientRect();
+
+  const x1 = event.clientX - bounds.left;
+  const x2 = bounds.right - bounds.left;
+  mouse.x = (x1 / x2) * 2 - 1;
+
+  const y1 = event.clientY - bounds.top;
+  const y2 = bounds.bottom - bounds.top;
+  mouse.y = -(y1 / y2) * 2 + 1;
+
+  // Places it on the camera pointing to the mouse
+  raycaster.setFromCamera(mouse, camera);
+
+  // Casts a ray
+  return raycaster.intersectObjects(ifcModels);
+}
+
+// Creates subset material
+const preselectMat = new MeshLambertMaterial({
+  transparent: true,
+  opacity: 0.6,
+  color: 0xff88ff,
+  depthTest: false,
+});
+
+const ifc = ifcLoader.ifcManager;
+
+// Reference to the previous selection
+let preselectModel = { id: -1 };
+
+function highlight(event, material, model) {
+  const found = cast(event)[0];
+  if (found) {
+    // Gets model ID
+    model.id = found.object.modelID;
+
+    // Gets Express ID
+    const index = found.faceIndex;
+    const geometry = found.object.geometry;
+    const id = ifc.getExpressId(geometry, index);
+
+    // Creates subset
+    ifcLoader.ifcManager.createSubset({
+      modelID: model.id,
+      ids: [id],
+      material: material,
+      scene: scene,
+      removePrevious: true,
+    });
+  } else {
+    // Removes previous highlight
+    ifc.removeSubset(model.id, material);
+  }
+}
+
+window.onmousemove = (event) => highlight(event, preselectMat, preselectModel);
+
+const selectMat = new MeshLambertMaterial({
+  transparent: true,
+  opacity: 0.6,
+  color: 0xff00ff,
+  depthTest: false,
+});
+
+const selectModel = { id: -1 };
+window.ondblclick = (event) => highlight(event, selectMat, selectModel);
